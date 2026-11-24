@@ -29,13 +29,18 @@ from __future__ import annotations
 from datetime import date
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Path, Query, status
+from fastapi import APIRouter, HTTPException, Path, Query, Response, status
 from pydantic import AliasChoices
 
-from . import repository
+from . import errata as errata_logic, repository
 from .models import (
     AllDistrictStats,
     DistrictStats,
+    EarTagErrataResponse,
+    ErrataBatchInput,
+    ErrataLineResult,
+    ErrataPlanResult,
+    ErrataRecaptureRow,
     ObservationCorrection,
     ObservationDetail,
     ObservationInput,
@@ -299,3 +304,127 @@ def stats(
     except (repository.SummaryLimitExceeded, repository.InvalidRangeError) as exc:
         raise _stats_http_error(exc)
     return AllDistrictStats(**result)
+
+
+# ---------------------------------------------------------------------------
+# Cross-district same-tag errata (misread review)
+# ---------------------------------------------------------------------------
+
+
+def _plan_result(plan) -> ErrataPlanResult:
+    return ErrataPlanResult(
+        changed_count=plan.changed_count,
+        lines=[
+            ErrataLineResult(
+                recognition_id=line.recognition_id,
+                district=line.district,
+                original_ear_tag=line.original_ear_tag,
+                new_ear_tag=line.new_ear_tag,
+                changed=line.changed,
+            )
+            for line in plan.lines
+        ],
+    )
+
+
+@router.post(
+    "/errata/ear-tag-batches",
+    response_model=EarTagErrataResponse,
+    summary="跨区同耳标勘误批：按最少改动求解，唯一最优时只改耳标落库",
+    description=(
+        "两处互不相通的围栏样区在同一天拍到相同耳标时，巡护员提交观测日、"
+        "两个片区和当天两区内至多 16 个不同识别记录号，每条带 1～3 个备选耳标。"
+        "只允许改耳标，观测日与片区不变；同区多拍允许。\n\n"
+        "求解在只读快照上进行，不持写锁，因此求解期间普通录入与更正仍可提交。"
+        "优化目标是改写记录数最少：\n\n"
+        "* 唯一最优（outcome=`applied`）：逐条新耳标落库，并返回落库后相关耳标"
+        "当天在两区的复拍汇总；\n"
+        "* 并列最优（outcome=`ambiguous`）：返回其中两套方案，不写库；\n"
+        "* 无解（outcome=`conflict`，HTTP 409）：返回冲突原因，不写库；\n"
+        "* 求解后待改记录已变，或批外记录改变了相关耳标当天两区占用"
+        "（outcome=`stale`，HTTP 409，retryable=true）：本次不写库，请重试；\n"
+        "  无关写入不影响提交。\n\n"
+        "整批改完后，本批原耳标与所有备选耳标都不会在当天跨区出现（批外记录照算）。"
+    ),
+    responses={
+        409: {"description": "无解（conflict）或求解后数据已变需重试（stale）"},
+        422: {"description": "请求不合法：片区相同、记录缺失、观测日或片区不匹配等"},
+    },
+)
+def submit_ear_tag_errata(
+    payload: ErrataBatchInput, http_response: Response
+) -> EarTagErrataResponse:
+    districts = (payload.districts[0], payload.districts[1])
+    items = [
+        {
+            "recognition_id": item.recognition_id,
+            "candidate_ear_tags": item.candidate_ear_tags,
+        }
+        for item in payload.items
+    ]
+    try:
+        errata_logic.validate_request(payload.observed_on, districts, payload.items)
+        snapshot = repository.load_errata_snapshot(
+            payload.observed_on, districts, items
+        )
+    except errata_logic.ErrataValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    outcome = errata_logic.solve_errata(snapshot)
+    common = {
+        "observed_on": payload.observed_on,
+        "districts": list(districts),
+        "solved_state_version": snapshot.state_version,
+    }
+
+    if outcome.outcome == "conflict":
+        http_response.status_code = status.HTTP_409_CONFLICT
+        return EarTagErrataResponse(
+            outcome="conflict",
+            reasons=outcome.reasons,
+            **common,
+        )
+
+    if outcome.outcome == "ambiguous":
+        return EarTagErrataResponse(
+            outcome="ambiguous",
+            plans=[_plan_result(plan) for plan in outcome.plans],
+            **common,
+        )
+
+    # Unique optimum.  A zero-change optimum needs no write transaction at all:
+    # the database already satisfies the constraint, so the state version stays
+    # exactly the solved one.  The recapture summary is a read-only snapshot.
+    plan = outcome.plans[0]
+    if plan.changed_count == 0:
+        return EarTagErrataResponse(
+            outcome="applied",
+            plans=[_plan_result(plan)],
+            recapture_summary=[
+                ErrataRecaptureRow(**row)
+                for row in repository.recapture_summary_for_snapshot(snapshot)
+            ],
+            committed_state_version=snapshot.state_version,
+            **common,
+        )
+
+    try:
+        saved = repository.apply_errata_plan(snapshot, plan)
+    except errata_logic.ErrataStaleError as exc:
+        http_response.status_code = status.HTTP_409_CONFLICT
+        return EarTagErrataResponse(
+            outcome="stale",
+            reasons=[exc.reason],
+            retryable=True,
+            **common,
+        )
+
+    return EarTagErrataResponse(
+        outcome="applied",
+        plans=[_plan_result(plan)],
+        recapture_summary=[
+            ErrataRecaptureRow(**row) for row in saved["recapture_summary"]
+        ],
+        committed_state_version=saved["state_version"],
+        **common,
+    )

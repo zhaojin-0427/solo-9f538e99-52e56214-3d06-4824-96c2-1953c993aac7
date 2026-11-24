@@ -204,3 +204,131 @@ class AllDistrictStats(BaseModel):
     total_multi_day_count: int = Field(description="所有片区至少两天个体数合计")
     districts: list[DistrictStatsBrief]
     state_version: int = Field(description="本次读取所依据的已提交状态版本号")
+
+
+# ---------------------------------------------------------------------------
+# Cross-district same-tag errata batch
+# ---------------------------------------------------------------------------
+
+
+class ErrataItem(BaseModel):
+    """One identification record of the errata batch and its candidate tags."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {"recognition_id": "REC-0007", "candidate_ear_tags": ["ET-2048", "ET-3072"]}
+            ]
+        },
+    )
+
+    recognition_id: Identifier = Field(
+        description="当天在两个片区之一拍到的识别记录号（批内唯一）",
+        validation_alias=AliasChoices(
+            "recognition_id", "recognition_record_id", "record_id", "id", "识别记录号"
+        ),
+    )
+    candidate_ear_tags: list[Identifier] = Field(
+        min_length=1,
+        max_length=3,
+        description="1～3 个备选耳标号；当前耳标自动作为零改动选项，无需重复填写",
+        validation_alias=AliasChoices(
+            "candidate_ear_tags", "candidate_tags", "candidates", "备选耳标"
+        ),
+    )
+
+
+class ErrataBatchInput(BaseModel):
+    """A same-day, two-district ear-tag misread review batch."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [
+                {
+                    "observed_on": "2026-03-01",
+                    "districts": ["北沟片区", "南坡片区"],
+                    "items": [
+                        {"recognition_id": "REC-0001", "candidate_ear_tags": ["ET-2048"]},
+                        {
+                            "recognition_id": "REC-0002",
+                            "candidate_ear_tags": ["ET-1024", "ET-4096"],
+                        },
+                    ],
+                }
+            ]
+        },
+    )
+
+    observed_on: date = Field(
+        description="观测日（YYYY-MM-DD）；批内记录当天必须确实位于这两个片区",
+        validation_alias=AliasChoices(
+            "observed_on", "observed_date", "date", "survey_date", "观测日"
+        ),
+    )
+    districts: list[Identifier] = Field(
+        min_length=2,
+        max_length=2,
+        description="互不相通的两个片区，顺序不影响求解",
+        validation_alias=AliasChoices("districts", "areas", "zones", "片区"),
+    )
+    items: list[ErrataItem] = Field(
+        min_length=1,
+        max_length=16,
+        description="当天两区内至多 16 个不同识别记录号；每条带 1～3 个备选耳标",
+    )
+
+
+class ErrataLineResult(BaseModel):
+    recognition_id: str = Field(description="识别记录号")
+    district: str = Field(description="片区（保持不变）")
+    original_ear_tag: str = Field(description="勘误前耳标号")
+    new_ear_tag: str = Field(description="勘误后耳标号（唯一最优时即为落库值）")
+    changed: bool = Field(description="该记录的耳标是否被改写")
+
+
+class ErrataPlanResult(BaseModel):
+    changed_count: int = Field(description="本方案改写的记录数（优化目标，取最小值）")
+    lines: list[ErrataLineResult] = Field(description="逐条新耳标，顺序与提交一致")
+
+
+class ErrataRecaptureRow(BaseModel):
+    district: str
+    ear_tag: str
+    day_count: int = Field(
+        description="勘误落库后该耳标当天在该片区的识别记录条数；同区多拍保留"
+    )
+
+
+class EarTagErrataResponse(BaseModel):
+    outcome: str = Field(
+        description=(
+            "applied：唯一最优且已落库；"
+            "ambiguous：存在并列最优，返回两套方案且不写库；"
+            "conflict：无解，不写库；"
+            "stale：求解后数据已变，本次不写库，请重试"
+        )
+    )
+    observed_on: date
+    districts: list[str]
+    solved_state_version: int | None = Field(
+        default=None, description="求解所依据的已提交状态版本号"
+    )
+    committed_state_version: int | None = Field(
+        default=None, description="落库后的已提交状态版本号（仅 applied）"
+    )
+    plans: list[ErrataPlanResult] = Field(
+        default_factory=list,
+        description="applied 时为唯一方案；ambiguous 时为两套并列最优方案",
+    )
+    recapture_summary: list[ErrataRecaptureRow] = Field(
+        default_factory=list,
+        description="落库后相关耳标当天在两区的复拍汇总（仅 applied）",
+    )
+    reasons: list[str] = Field(
+        default_factory=list, description="conflict 或 stale 的具体原因"
+    )
+    retryable: bool = Field(
+        default=False, description="stale 时为 true，提示按当前数据重新提交求解"
+    )

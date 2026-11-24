@@ -37,7 +37,9 @@ from collections.abc import Mapping, Sequence
 from datetime import date
 from typing import Any
 
+from . import errata as errata_logic
 from .db import MAX_SUMMARY_ROWS, read_transaction, write_transaction
+from .errata import ErrataRecord, ErrataSnapshot, ErrataStaleError
 
 
 class NotFoundError(Exception):
@@ -533,3 +535,316 @@ def all_district_stats(
         "districts": districts,
         "state_version": version,
     }
+
+
+# ---------------------------------------------------------------------------
+# Cross-district same-tag errata batch
+#
+# Read volume is bounded by the batch: at most 16 detail rows (the records
+# under review, fetched by unique key) plus one summary row per relevant
+# (district, ear tag) -- the relevant tags are the original tags and the
+# candidate tags only.  Solving itself runs on that snapshot outside any write
+# lock, so ordinary entry and correction stays available while it runs.
+# ---------------------------------------------------------------------------
+
+
+def _day_count(row: Mapping[str, Any] | None, day: str) -> int:
+    """Identification count of one summary row on one day (0 when absent)."""
+    if row is None:
+        return 0
+    entries = _parse_days(row["day_counts"])
+    pos = _index_of(entries, day)
+    if pos < len(entries) and entries[pos][0] == day:
+        return int(entries[pos][1])
+    return 0
+
+
+def load_errata_snapshot(
+    observed_on: date,
+    districts: tuple[str, str],
+    items: Sequence[Mapping[str, Any]],
+    db_path: str | None = None,
+) -> ErrataSnapshot:
+    """Read one committed state for an errata batch.
+
+    Only the batch detail rows and the two-district summary rows of original /
+    candidate ear tags are read; unrelated records and tags are never scanned.
+    """
+    day = observed_on.isoformat()
+    ids = [item["recognition_id"] for item in items]
+    candidates_by_id = {
+        item["recognition_id"]: tuple(dict.fromkeys(item["candidate_ear_tags"]))
+        for item in items
+    }
+    relevant_tags = set()
+    for item in items:
+        relevant_tags.update(item["candidate_ear_tags"])
+
+    placeholders = ",".join("?" for _ in ids)
+    with read_transaction(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT recognition_id, observed_on, district, ear_tag
+            FROM observations
+            WHERE committed = 1 AND recognition_id IN ({placeholders})
+            """,
+            ids,
+        ).fetchall()
+        by_id = {row["recognition_id"]: row for row in rows}
+
+        missing = [rid for rid in ids if rid not in by_id]
+        if missing:
+            raise errata_logic.ErrataValidationError(
+                f"识别记录号不存在：{', '.join(missing)}"
+            )
+
+        records: list[ErrataRecord] = []
+        for rid in ids:
+            row = by_id[rid]
+            if row["observed_on"] != day:
+                raise errata_logic.ErrataValidationError(
+                    f"记录 {rid} 的观测日为 {row['observed_on']}，"
+                    f"与勘误观测日 {day} 不一致"
+                )
+            if row["district"] not in districts:
+                raise errata_logic.ErrataValidationError(
+                    f"记录 {rid} 位于片区 {row['district']}，"
+                    f"不属于勘误片区 {districts[0]} / {districts[1]}"
+                )
+            relevant_tags.add(row["ear_tag"])
+            records.append(
+                ErrataRecord(
+                    recognition_id=rid,
+                    observed_on=day,
+                    district=row["district"],
+                    ear_tag=row["ear_tag"],
+                    candidates=candidates_by_id[rid],
+                )
+            )
+
+        tag_list = sorted(relevant_tags)
+        tag_placeholders = ",".join("?" for _ in tag_list)
+        district_placeholders = ",".join("?" for _ in districts)
+        summary_rows = conn.execute(
+            f"""
+            SELECT district, ear_tag, day_counts
+            FROM tag_summaries
+            WHERE committed = 1
+              AND district IN ({district_placeholders})
+              AND ear_tag IN ({tag_placeholders})
+            """,
+            [*districts, *tag_list],
+        ).fetchall()
+        version = _state_version(conn)
+
+    # Total (district, tag, day) counts from the maintained summaries.
+    total_occ: dict[str, list[int]] = {
+        tag: [0, 0] for tag in tag_list
+    }
+    for row in summary_rows:
+        idx = districts.index(row["district"])
+        total_occ.setdefault(row["ear_tag"], [0, 0])[idx] = _day_count(row, day)
+
+    # Subtract the batch's own identifications so outside_occ counts records
+    # the errata is not allowed to rewrite.
+    outside_occ: dict[str, tuple[int, int]] = {
+        tag: (counts[0], counts[1]) for tag, counts in total_occ.items()
+    }
+    for record in records:
+        counts = list(outside_occ.setdefault(record.ear_tag, (0, 0)))
+        counts[districts.index(record.district)] -= 1
+        outside_occ[record.ear_tag] = (counts[0], counts[1])
+
+    return ErrataSnapshot(
+        observed_on=day,
+        districts=districts,
+        records=tuple(records),
+        outside_occ=outside_occ,
+        state_version=version,
+    )
+
+
+def recapture_summary_for_snapshot(
+    snapshot: "ErrataSnapshot",
+    db_path: str | None = None,
+) -> list[dict[str, Any]]:
+    """Read-only same-day recapture summary for a snapshot's relevant tags."""
+    day = snapshot.observed_on
+    districts = snapshot.districts
+    relevant_tags = sorted(
+        {tag for record in snapshot.records for tag in record.domain()}
+    )
+    tag_placeholders = ",".join("?" for _ in relevant_tags)
+    district_placeholders = ",".join("?" for _ in districts)
+    with read_transaction(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT district, ear_tag, day_counts
+            FROM tag_summaries
+            WHERE committed = 1
+              AND district IN ({district_placeholders})
+              AND ear_tag IN ({tag_placeholders})
+            """,
+            [*districts, *relevant_tags],
+        ).fetchall()
+
+    counts = {(row["district"], row["ear_tag"]): _day_count(row, day) for row in rows}
+    return [
+        {
+            "district": district,
+            "ear_tag": tag,
+            "day_count": counts.get((district, tag), 0),
+        }
+        for tag in relevant_tags
+        for district in districts
+    ]
+
+
+def _apply_summary_delta(
+    conn, district: str, ear_tag: str, day: str, delta: int
+) -> None:
+    """Adjust one (district, ear tag, day) count by a net batch delta."""
+    if delta == 0:
+        return
+    row = _load_summary(conn, district, ear_tag)
+    entries = _parse_days(row["day_counts"]) if row is not None else []
+    pos = _index_of(entries, day)
+    if pos < len(entries) and entries[pos][0] == day:
+        entries[pos][1] += delta
+        if entries[pos][1] <= 0:
+            del entries[pos]
+    else:
+        if delta <= 0:
+            raise RuntimeError("summary day missing; refusing to commit")
+        entries.insert(pos, [day, delta])
+    _save_summary(conn, district, ear_tag, entries)
+
+
+def apply_errata_plan(
+    snapshot: ErrataSnapshot,
+    plan,
+    db_path: str | None = None,
+) -> dict[str, Any]:
+    """Rewrite only ear tags for one uniquely-optimal plan, atomically.
+
+    The write transaction re-reads the batch rows and the relevant summaries
+    first.  If a batch record changed, or batch-outside records altered the
+    two-district occupation of any relevant tag on that day, nothing is written
+    and :class:`ErrataStaleError` asks the caller to solve again.  Unrelated
+    writes (other days, other districts, unrelated tags) do not invalidate the
+    plan.
+    """
+    day = snapshot.observed_on
+    districts = snapshot.districts
+    ids = [record.recognition_id for record in snapshot.records]
+    relevant_tags = sorted(
+        {tag for record in snapshot.records for tag in record.domain()}
+    )
+    chosen = plan.as_tag_map()
+    placeholders = ",".join("?" for _ in ids)
+    tag_placeholders = ",".join("?" for _ in relevant_tags)
+    district_placeholders = ",".join("?" for _ in districts)
+
+    with write_transaction(db_path) as conn:
+        fresh_rows = conn.execute(
+            f"""
+            SELECT recognition_id, observed_on, district, ear_tag
+            FROM observations
+            WHERE committed = 1 AND recognition_id IN ({placeholders})
+            """,
+            ids,
+        ).fetchall()
+        fresh_by_id = {row["recognition_id"]: row for row in fresh_rows}
+
+        for record in snapshot.records:
+            row = fresh_by_id.get(record.recognition_id)
+            if row is None:
+                raise ErrataStaleError(
+                    f"待改记录 {record.recognition_id} 已不存在，请按当前数据重试"
+                )
+            if (
+                row["observed_on"] != record.observed_on
+                or row["district"] != record.district
+                or row["ear_tag"] != record.ear_tag
+            ):
+                raise ErrataStaleError(
+                    f"待改记录 {record.recognition_id} 的值在求解后已变化，请重试"
+                )
+
+        fresh_summaries = conn.execute(
+            f"""
+            SELECT district, ear_tag, day_counts
+            FROM tag_summaries
+            WHERE committed = 1
+              AND district IN ({district_placeholders})
+              AND ear_tag IN ({tag_placeholders})
+            """,
+            [*districts, *relevant_tags],
+        ).fetchall()
+
+        fresh_total: dict[str, list[int]] = {
+            tag: [0, 0] for tag in relevant_tags
+        }
+        for row in fresh_summaries:
+            fresh_total.setdefault(row["ear_tag"], [0, 0])[
+                districts.index(row["district"])
+            ] = _day_count(row, day)
+
+        # Batch-internal counts are identical to the snapshot when the detail
+        # rows are unchanged, so total occupation equality is exactly the
+        # "batch-outside occupation unchanged" check the spec requires.
+        snapshot_total: dict[str, list[int]] = {
+            tag: list(counts) for tag, counts in snapshot.outside_occ.items()
+        }
+        for record in snapshot.records:
+            snapshot_total.setdefault(record.ear_tag, [0, 0])[
+                districts.index(record.district)
+            ] += 1
+        for tag in relevant_tags:
+            if fresh_total.get(tag, [0, 0]) != snapshot_total.get(tag, [0, 0]):
+                raise ErrataStaleError(
+                    f"耳标 {tag} 当天在两区的批外占用在求解后已变化，请重试"
+                )
+
+        # Net per-scope deltas: one +1 / -1 per rewritten identification.
+        deltas: dict[tuple[str, str], int] = {}
+        for record in snapshot.records:
+            new_tag = chosen[record.recognition_id]
+            if new_tag == record.ear_tag:
+                continue
+            old_key = (record.district, record.ear_tag)
+            new_key = (record.district, new_tag)
+            deltas[old_key] = deltas.get(old_key, 0) - 1
+            deltas[new_key] = deltas.get(new_key, 0) + 1
+            conn.execute(
+                """
+                UPDATE observations
+                SET ear_tag = ?,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                WHERE recognition_id = ? AND committed = 1
+                """,
+                (new_tag, record.recognition_id),
+            )
+        for (district, ear_tag), delta in deltas.items():
+            _apply_summary_delta(conn, district, ear_tag, day, delta)
+
+        version = _bump_state_version(conn)
+
+        # Post-commit recapture summary of the relevant tags on that day.
+        recapture: list[dict[str, Any]] = []
+        for tag in relevant_tags:
+            for idx, district in enumerate(districts):
+                row = _load_summary(conn, district, tag)
+                count = _day_count(row, day)
+                recapture.append(
+                    {
+                        "district": district,
+                        "ear_tag": tag,
+                        "day_count": count,
+                    }
+                )
+
+        return {
+            "state_version": version,
+            "recapture_summary": recapture,
+        }
